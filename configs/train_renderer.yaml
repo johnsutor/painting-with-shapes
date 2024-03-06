@@ -1,15 +1,19 @@
 defaults:
   - _self_
 
-experiment_name: ${now:%Y-%m-%d_%H-%M-%S}
-seed: 42
+batch_size: 64
+canvas_size: 128
 cpu: false
-mixed_precision: 'no'
+data_path: ../data
+experiment_name: ${now:%Y-%m-%d_%H-%M-%S}
 learning_rate: 0.01
-steps: 1000
+log_interval: 100
+loss_ema_decay: 0.999
+mixed_precision: 'no'
 num_workers: 4
 pin_memory: true
-batch_size: 64
+seed: 42
+steps: 10_000
 
 hydra:
   run:
