@@ -1,20 +1,18 @@
-import os
+# !/usr/bin/env python3
 
 import hydra
 import torch
 import torch.nn as nn
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from aim import Distribution, Image
+from aim import Image
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader
-from torchvision.datasets import ImageFolder
-from torchvision.transforms import v2
 from torchvision.utils import make_grid
 from tqdm import tqdm
 
 from neural_renderer import NeuralRenderer
 from renderer import ImageRenderer
+from scheduler import LinearWarmupCosineAnnealingLR
 
 
 @hydra.main(config_path="../configs", config_name="train_renderer")
@@ -54,8 +52,14 @@ def main(cfg):
         lr=cfg.learning_rate,
     )
 
-    neural_renderer, criterion, optimizer = accelerator.prepare(
-        neural_renderer, criterion, optimizer
+    scheduler = LinearWarmupCosineAnnealingLR(
+        optimizer=optimizer,
+        warmup_epochs=int(cfg.warmup_percentage * cfg.steps),
+        max_epochs=cfg.steps,
+    )
+
+    neural_renderer, criterion, scheduler, optimizer = accelerator.prepare(
+        neural_renderer, criterion, scheduler, optimizer
     )
 
     ema_loss = 0
@@ -89,6 +93,7 @@ def main(cfg):
 
         accelerator.backward(loss)
         optimizer.step()
+        scheduler.step()
 
         ema_loss = cfg.loss_ema_decay * 0.99 + loss.item() * (1 - cfg.loss_ema_decay)
 

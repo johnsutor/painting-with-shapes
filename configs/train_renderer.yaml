@@ -2,7 +2,7 @@ defaults:
   - _self_
 
 batch_size: 64
-canvas_size: 128
+canvas_size: 64
 cpu: false
 data_path: ../data
 experiment_name: ${now:%Y-%m-%d_%H-%M-%S}
@@ -13,7 +13,8 @@ mixed_precision: 'no'
 num_workers: 4
 pin_memory: true
 seed: 42
-steps: 10_000
+steps: 100_000
+warmup_percentage: 0.1
 
 hydra:
   run:

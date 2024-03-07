@@ -41,7 +41,7 @@ class NeuralRenderer(nn.Module):
         self.path = path
 
         if not mapping:
-            m = resnet18(pretrained=True)
+            m = resnet18()
             m = nn.Sequential(*list(m.children())[:-2], nn.Flatten())
             m[0] = nn.Conv2d(
                 4,
@@ -55,27 +55,31 @@ class NeuralRenderer(nn.Module):
 
         # Follow https://github.com/megvii-research/ICCV2019-LearningToPaint/blob/master/baseline/Renderer/model.py closely
         self.parameters_ff = nn.Sequential(
-            nn.Linear(4, 512),
+            nn.Linear(4, 256),
             nn.ReLU(),
-            nn.Linear(512, 2048),
+            nn.Linear(256, 512),
             nn.ReLU(),
         )
 
+        # Calculate first channel size
         self.conv_ff = nn.Sequential(
-            nn.Linear(4096, 8192),
+            nn.Linear(1024, 2048),
             nn.ReLU(),
-            nn.Linear(8192, 4096),
+            nn.Linear(2048, 1024),
             nn.ReLU(),
-            nn.Unflatten(1, (16, 16, 16)),
+            nn.Unflatten(1, (16, 8, 8)),
             nn.Conv2d(16, 32, 3, 1, 1),
+            nn.InstanceNorm2d(32),
             nn.ReLU(),
             nn.Conv2d(32, 32, 3, 1, 1),
             nn.PixelShuffle(2),
             nn.Conv2d(8, 16, 3, 1, 1),
+            nn.InstanceNorm2d(16),
             nn.ReLU(),
             nn.Conv2d(16, 16, 3, 1, 1),
             nn.PixelShuffle(2),
             nn.Conv2d(4, 8, 3, 1, 1),
+            nn.InstanceNorm2d(8),
             nn.ReLU(),
             nn.Conv2d(8, 16, 3, 1, 1),
             nn.PixelShuffle(2),
