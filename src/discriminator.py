@@ -1,4 +1,4 @@
-# !/usr/bin/env python3
+#!/usr/bin/env python
 # https://github.com/w86763777/pytorch-gan-collections/blob/master/source/models/sngan.py
 
 import torch

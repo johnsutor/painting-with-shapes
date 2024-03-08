@@ -1,4 +1,4 @@
-# !/usr/bin/env python3
+#!/usr/bin/env python
 # Taken from https://github.com/Lightning-Universe/lightning-bolts/blob/9ae0581776ddfef4d9ccc2f3709499d00e22be2e/src/pl_bolts/optimizers/lr_scheduler.py
 
 import math
