@@ -8,7 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torch import Tensor
-from torchvision.models import resnet18
 from torchvision.transforms import v2
 
 
@@ -18,108 +17,49 @@ class NeuralRenderer(nn.Module):
 
     def __init__(
         self,
+        embedding_size: int,
+        embedding_dim: int = 508,
         image_size: int = 128,
-        mapping: Dict[int, Tensor] = None,
-        path: os.PathLike = None,
     ):
         """Args:
+
         image_size (int, optional): The size of the image. Defaults to 128.
-        mapping (Dict[int, Tensor], optional): A mapping of the image index to the encoded image tensor (useful for pre-computed encodings). If not provided, the images are encoded using a ResNet18 model. Defaults to None.
         """
         super().__init__()
-        valid_image_extensions = tuple(Image.registered_extensions().keys())
-        self.paths = sorted(
-            [
-                os.path.join(path, f)
-                for f in os.listdir(path)
-                if f.endswith(valid_image_extensions)
-            ]
-        )
 
         self.image_size = image_size
-        self.mapping = mapping
-        self.path = path
-
-        if not mapping:
-            m = resnet18()
-            m = nn.Sequential(*list(m.children())[:-2], nn.Flatten())
-            m[0] = nn.Conv2d(
-                4,
-                m[0].out_channels,
-                kernel_size=m[0].kernel_size,
-                stride=m[0].stride,
-                padding=m[0].padding,
-                bias=False,
-            )
-            self.image_encoder = m  # Include all but the Linear and avgpool layers
+        self.embedding = nn.Embedding(embedding_size, embedding_dim)
 
         # Follow https://github.com/megvii-research/ICCV2019-LearningToPaint/blob/master/baseline/Renderer/model.py closely
-        self.parameters_ff = nn.Sequential(
-            nn.Linear(4, 256),
-            nn.ReLU(),
-            nn.Linear(256, 512),
-            nn.ReLU(),
-        )
-
         # Calculate first channel size
         self.conv_ff = nn.Sequential(
-            nn.Linear(1024, 2048),
-            nn.ReLU(),
-            nn.Linear(2048, 1024),
-            nn.ReLU(),
-            nn.Unflatten(1, (16, 8, 8)),
-            nn.Conv2d(16, 32, 3, 1, 1),
-            nn.InstanceNorm2d(32),
-            nn.ReLU(),
+            nn.Linear(embedding_dim + 4, 2048, bias=False),
+            nn.BatchNorm1d(2048),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Linear(2048, 4096, bias=False),
+            nn.BatchNorm1d(4096),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Linear(4096, (image_size // 8 * image_size // 8 * 16), bias=False),
+            nn.BatchNorm1d((image_size // 8 * image_size // 8 * 16)),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Unflatten(1, (16, image_size // 8, image_size // 8)),
+            nn.Conv2d(16, 32, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.1, inplace=True),
             nn.Conv2d(32, 32, 3, 1, 1),
             nn.PixelShuffle(2),
-            nn.Conv2d(8, 16, 3, 1, 1),
-            nn.InstanceNorm2d(16),
-            nn.ReLU(),
+            nn.Conv2d(8, 16, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.LeakyReLU(0.1, inplace=True),
             nn.Conv2d(16, 16, 3, 1, 1),
             nn.PixelShuffle(2),
-            nn.Conv2d(4, 8, 3, 1, 1),
-            nn.InstanceNorm2d(8),
-            nn.ReLU(),
+            nn.Conv2d(4, 8, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(8),
+            nn.LeakyReLU(0.1, inplace=True),
             nn.Conv2d(8, 16, 3, 1, 1),
             nn.PixelShuffle(2),
             nn.Tanh(),
         )
-
-        self.transform = v2.Compose(
-            [
-                v2.ToImage(),
-                v2.Resize((self.image_size // 2, self.image_size // 2)),
-                v2.ToDtype(torch.float32, scale=True),
-                v2.Normalize([0.5, 0.5, 0.5, 0.5], [0.5, 0.5, 0.5, 0.5]),
-            ]
-        )
-
-    def _load_image(self, idx: int) -> Tensor:
-        """Loads an image from the given path and returns it as a tensor. The image is resized to the
-        specified image size.
-
-        Args:
-            path (os.PathLike): The path to the image.
-
-        Returns:
-            Tensor: The image as a tensor.
-        """
-        image = Image.open(self.paths[idx]).convert("RGBA")
-        return self.transform(image)
-
-    def get_encoded_images(self, images: Tensor, idx: Tensor) -> Dict[int, Tensor]:
-        """Encodes the images using a pre-trained ResNet18 model. The images are expected to be of shape (B, C, H, W).
-
-        Args:
-            images (Tensor): The images to encode.
-            idx (Tensor): The index of the images.
-
-        Returns:
-            Dict[int, Tensor]: The encoded images.
-        """
-        encoded_images = self.image_encoder(images)
-        return {i: encoded_images[j] for j, i in enumerate(idx)}
 
     def forward(
         self,
@@ -128,7 +68,6 @@ class NeuralRenderer(nn.Module):
         rotation: Tensor,
         location_x: Tensor,
         location_y: Tensor,
-        device: torch.device = torch.device("cpu"),
     ) -> Tensor:
         """Renders the images on a canvas. Expected shape of the images is (B, C, H, W) if not using
         mappings, and shape (B, 1) if using mappings. The expected shape of each of the other parameters
@@ -145,18 +84,16 @@ class NeuralRenderer(nn.Module):
         Returns:
             Tensor: The rendered images.
         """
-        if self.mapping:
-            images = torch.stack([self.mapping[i] for i in images], dim=0).to(device)
-        else:
-            images = torch.stack([self._load_image(i) for i in image_idx], dim=0).to(
-                device
-            )
-            images = self.image_encoder(images)
 
-        parameters = torch.cat([scale, rotation, location_x, location_y], dim=1).to(
-            device
+        embeddings = self.embedding(image_idx).squeeze(1)
+        parameters = torch.cat(
+            [
+                embeddings,
+                scale,
+                rotation,
+                location_x,
+                location_y,
+            ],
+            dim=1,
         )
-        parameters = self.parameters_ff(parameters)
-        x = torch.cat([images, parameters], dim=1)
-
-        return self.conv_ff(x)
+        return self.conv_ff(parameters)

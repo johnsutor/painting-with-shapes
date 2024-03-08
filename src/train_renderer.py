@@ -3,16 +3,23 @@
 import hydra
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from aim import Image
 from omegaconf import OmegaConf
+from piq import DISTS
 from torchvision.utils import make_grid
 from tqdm import tqdm
 
+from discriminator import Discriminator
 from neural_renderer import NeuralRenderer
 from renderer import ImageRenderer
 from scheduler import LinearWarmupCosineAnnealingLR
+
+
+def hinge_loss(real, fake):
+    return (F.relu(1 + real) + F.relu(1 - fake)).mean()
 
 
 @hydra.main(config_path="../configs", config_name="train_renderer")
@@ -41,40 +48,78 @@ def main(cfg):
     )
 
     neural_renderer = NeuralRenderer(
-        image_size=cfg.canvas_size,
-        path=cfg.data_path,
+        image_size=cfg.canvas_size, embedding_size=len(image_renderer)
+    )
+
+    discriminator = Discriminator(
+        image_size=cfg.canvas_size, embedding_size=len(image_renderer)
     )
 
     criterion = nn.MSELoss()
 
-    optimizer = torch.optim.Adam(
+    renderer_optimizer = torch.optim.Adam(
         neural_renderer.parameters(),
         lr=cfg.learning_rate,
     )
 
-    scheduler = LinearWarmupCosineAnnealingLR(
-        optimizer=optimizer,
+    discriminator_optimizer = torch.optim.Adam(
+        discriminator.parameters(),
+        lr=cfg.learning_rate,
+    )
+
+    renderer_scheduler = LinearWarmupCosineAnnealingLR(
+        optimizer=renderer_optimizer,
         warmup_epochs=int(cfg.warmup_percentage * cfg.steps),
         max_epochs=cfg.steps,
     )
 
-    neural_renderer, criterion, scheduler, optimizer = accelerator.prepare(
-        neural_renderer, criterion, scheduler, optimizer
+    discriminator_scheduler = LinearWarmupCosineAnnealingLR(
+        optimizer=discriminator_optimizer,
+        warmup_epochs=int(cfg.warmup_percentage * cfg.steps),
+        max_epochs=cfg.steps,
     )
 
-    ema_loss = 0
+    perceptual_loss = DISTS()
+
+    (
+        neural_renderer,
+        discriminator,
+        criterion,
+        renderer_optimizer,
+        discriminator_optimizer,
+        renderer_scheduler,
+        discriminator_scheduler,
+        perceptual_loss,
+    ) = accelerator.prepare(
+        neural_renderer,
+        discriminator,
+        criterion,
+        renderer_optimizer,
+        discriminator_optimizer,
+        renderer_scheduler,
+        discriminator_scheduler,
+        perceptual_loss,
+    )
 
     for step in range(cfg.steps):
-        image_renderer.clear()
-        optimizer.zero_grad(set_to_none=True)
-        neural_renderer.train()
+        # Train discriminator
+        discriminator_optimizer.zero_grad()
+        neural_renderer.eval()
+        discriminator.train()
 
-        # Generate random parameters on the fly during training
-        image_idx = torch.randint(0, len(image_renderer), (cfg.batch_size, 1))
-        rotation = torch.ones((cfg.batch_size, 1)).uniform_(-1, 1)
-        scale = torch.ones((cfg.batch_size, 1)).uniform_(-1, 1)
-        location_x = torch.ones((cfg.batch_size, 1)).uniform_(-1, 1)
-        location_y = torch.ones((cfg.batch_size, 1)).uniform_(-1, 1)
+        image_idx = torch.randint(0, len(image_renderer), (cfg.batch_size, 1)).to(
+            accelerator.device
+        )
+        rotation = (
+            torch.ones((cfg.batch_size, 1)).uniform_(-1, 1).to(accelerator.device)
+        )
+        scale = torch.ones((cfg.batch_size, 1)).uniform_(-1, 1).to(accelerator.device)
+        location_x = (
+            torch.ones((cfg.batch_size, 1)).uniform_(-1, 1).to(accelerator.device)
+        )
+        location_y = (
+            torch.ones((cfg.batch_size, 1)).uniform_(-1, 1).to(accelerator.device)
+        )
 
         rendered_images = image_renderer(
             image_idx, scale, rotation, location_x, location_y
@@ -86,19 +131,72 @@ def main(cfg):
             rotation,
             location_x,
             location_y,
-            device=accelerator.device,
         )
 
-        loss = criterion(neural_images, rendered_images)
+        disc_real = discriminator(
+            neural_images, image_idx, scale, rotation, location_x, location_y
+        )
+        disc_fake = discriminator(
+            rendered_images, image_idx, scale, rotation, location_x, location_y
+        )
+
+        loss = hinge_loss(disc_real, disc_fake) + criterion(
+            rendered_images, neural_images
+        )
 
         accelerator.backward(loss)
-        optimizer.step()
-        scheduler.step()
+        discriminator_optimizer.step()
+        discriminator_scheduler.step()
 
-        ema_loss = cfg.loss_ema_decay * 0.99 + loss.item() * (1 - cfg.loss_ema_decay)
+        # Train neural renderer
+        discriminator.eval()
+        neural_renderer.train()
+
+        image_idx = torch.randint(0, len(image_renderer), (cfg.batch_size, 1)).to(
+            accelerator.device
+        )
+        rotation = (
+            torch.ones((cfg.batch_size, 1)).uniform_(-1, 1).to(accelerator.device)
+        )
+        scale = torch.ones((cfg.batch_size, 1)).uniform_(-1, 1).to(accelerator.device)
+        location_x = (
+            torch.ones((cfg.batch_size, 1)).uniform_(-1, 1).to(accelerator.device)
+        )
+        location_y = (
+            torch.ones((cfg.batch_size, 1)).uniform_(-1, 1).to(accelerator.device)
+        )
+
+        rendered_images = image_renderer(
+            image_idx, scale, rotation, location_x, location_y
+        ).to(accelerator.device)
+
+        neural_images = neural_renderer(
+            image_idx,
+            scale,
+            rotation,
+            location_x,
+            location_y,
+        )
+
+        loss = torch.mean(
+            discriminator(
+                neural_images, image_idx, scale, rotation, location_x, location_y
+            )
+        )
+
+        accelerator.backward(loss)
+        renderer_optimizer.step()
+        renderer_scheduler.step()
 
         if step % cfg.log_interval == 0:
-            accelerator.log({"loss": ema_loss, "step": step})
+            perceptual_loss.eval()
+            with torch.no_grad():
+                # Only calculate the loss on the RGB channels
+                loss_p = perceptual_loss(
+                    neural_images[:, :3, ...], rendered_images[:, :3, ...]
+                ).item()
+
+            accelerator.log({"perceptual_loss": loss_p, "step": step})
             accelerator.get_tracker("aim").tracker.track(
                 Image(make_grid(rendered_images, normalize=True)),
                 name="Rendered Images",
@@ -109,9 +207,9 @@ def main(cfg):
                 name="Neural Images",
                 step=step,
             )
-            accelerator.print(f"Step: {step}, Loss: {ema_loss}")
+            accelerator.print(f"Step: {step}, Perceptual Loss: {loss_p}")
 
-    return ema_loss
+    return loss_p
 
 
 if __name__ == "__main__":
